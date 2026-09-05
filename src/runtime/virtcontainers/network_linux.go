@@ -1138,12 +1138,14 @@ func setupTCFiltering(ctx context.Context, endpoint Endpoint, queues int, disabl
 	// the one inside the VM in order to avoid any firewall issues. The
 	// bridge created by the network plugin on the host actually expects
 	// to see traffic from this MAC address and not another one.
-	if len(attrs.HardwareAddr) == 0 {
-		// L3 devices (e.g., netkit in L3 mode) have no MAC address and are not currently supported.
-		// They require IP routing instead of L2 bridging, which is not currently implemented.
-		return fmt.Errorf("Device %s has no MAC address (netkit L3 mode is not supported - use netkit L2 mode or veth devices)", attrs.Name)
-	}
+	//
+	// L3 devices (netkit in L3 mode) have no MAC address and ignore the
+	// Ethernet header, so any MAC works for the VM side: use the random
+	// one generated for the network pair.
 	netPair.TAPIface.HardAddr = attrs.HardwareAddr.String()
+	if len(attrs.HardwareAddr) == 0 {
+		netPair.TAPIface.HardAddr = netPair.VirtIface.HardAddr
+	}
 
 	if err := netHandle.LinkSetMTU(tapLink, attrs.MTU); err != nil {
 		return fmt.Errorf("Could not set TAP MTU %d: %s", attrs.MTU, err)
@@ -1163,11 +1165,25 @@ func setupTCFiltering(ctx context.Context, endpoint Endpoint, queues int, disabl
 		return err
 	}
 
-	if err := addRedirectTCFilter(attrs.Index, tapAttrs.Index); err != nil {
+	// An L3 device (netkit in L3 mode) has an all-zero MAC and its
+	// kernel stack builds and accepts frames addressed to that zero MAC
+	// only. The VM NIC has a real MAC, so rewrite the destination MAC in
+	// both directions to keep each side's IP stack from dropping the
+	// frame as PACKET_OTHERHOST.
+	var toVM, toHost net.HardwareAddr
+	if len(attrs.HardwareAddr) == 0 {
+		toVM, err = net.ParseMAC(netPair.TAPIface.HardAddr)
+		if err != nil {
+			return err
+		}
+		toHost = make(net.HardwareAddr, len(toVM))
+	}
+
+	if err := addRedirectTCFilter(attrs.Index, tapAttrs.Index, toVM); err != nil {
 		return err
 	}
 
-	if err := addRedirectTCFilter(tapAttrs.Index, attrs.Index); err != nil {
+	if err := addRedirectTCFilter(tapAttrs.Index, attrs.Index, toHost); err != nil {
 		return err
 	}
 
@@ -1210,22 +1226,31 @@ func addQdiscIngress(index int) error {
 //
 // This is equivalent to calling:
 // `tc filter add dev source parent ffff: protocol all u32 match u8 0 0 action mirred egress redirect dev dest`
-func addRedirectTCFilter(sourceIndex, destIndex int) error {
+// addRedirectTCFilter redirects all ingress traffic of sourceIndex to the
+// egress of destIndex. When dstMAC is not nil the destination MAC of each
+// frame is rewritten to it first.
+func addRedirectTCFilter(sourceIndex, destIndex int, dstMAC net.HardwareAddr) error {
+	var actions []netlink.Action
+	if dstMAC != nil {
+		pedit := netlink.NewPeditAction()
+		pedit.DstMacAddr = dstMAC
+		actions = append(actions, pedit)
+	}
+	actions = append(actions, &netlink.MirredAction{
+		ActionAttrs: netlink.ActionAttrs{
+			Action: netlink.TC_ACT_STOLEN,
+		},
+		MirredAction: netlink.TCA_EGRESS_REDIR,
+		Ifindex:      destIndex,
+	})
+
 	filter := &netlink.U32{
 		FilterAttrs: netlink.FilterAttrs{
 			LinkIndex: sourceIndex,
 			Parent:    netlink.MakeHandle(0xffff, 0),
 			Protocol:  unix.ETH_P_ALL,
 		},
-		Actions: []netlink.Action{
-			&netlink.MirredAction{
-				ActionAttrs: netlink.ActionAttrs{
-					Action: netlink.TC_ACT_STOLEN,
-				},
-				MirredAction: netlink.TCA_EGRESS_REDIR,
-				Ifindex:      destIndex,
-			},
-		},
+		Actions: actions,
 	}
 
 	if err := netlink.FilterAdd(filter); err != nil {
@@ -1610,7 +1635,7 @@ func addIFBRedirecting(sourceIndex int, ifbIndex int) error {
 		return err
 	}
 
-	if err := addRedirectTCFilter(sourceIndex, ifbIndex); err != nil {
+	if err := addRedirectTCFilter(sourceIndex, ifbIndex, nil); err != nil {
 		return err
 	}
 
