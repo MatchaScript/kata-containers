@@ -231,3 +231,9 @@ devicemapper = { git = "https://github.com/stratis-storage/devicemapper-rs", rev
 [profile.release.package."kata-deploy"]
 opt-level = "z"
 codegen-units = 1
+
+# The netkit L3 endpoints need the `pedit` action, which upstream
+# netlink-packet-route does not carry yet. Patch every "0.30" requirement
+# so the resource crate and rtnetlink 0.21 share one crate instance.
+[patch.crates-io]
+netlink-packet-route = { git = "https://github.com/MatchaScript/netlink-packet-route", rev = "891f6772d0052d030cc715f9e8802ef5e46818e1" }
