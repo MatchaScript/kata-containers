@@ -317,7 +317,7 @@ async fn create_endpoint(
             // netdevs that is_physical_iface() cannot classify via
             // ethtool BusInfo. Handle them the same way as veth
             // endpoints, using the configured network model.
-            "veth" | "device" => {
+            "veth" | "netkit" | "device" => {
                 let ret = VethEndpoint::new(
                     &d,
                     handle,
