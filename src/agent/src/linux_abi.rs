@@ -9,8 +9,10 @@ use cfg_if::cfg_if;
 use std::str::FromStr;
 // Linux ABI related constants.
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", test))]
 use std::fs;
+#[cfg(any(target_arch = "aarch64", test))]
+use std::path::Path;
 
 pub const SYSFS_DIR: &str = "/sys";
 #[cfg(any(
@@ -65,49 +67,40 @@ pub fn pcipath_from_dev_tree_path(dev_tree_path: &str) -> Result<(&str, pci::Pat
     }
 }
 
+// Finds the platform device that hosts the PCI root complex. The device tree
+// node name varies by VMM ("pcie@..." on QEMU virt, "pci@..." on Cloud
+// Hypervisor), so match on the pci0000:<root complex> child instead.
+#[cfg(any(target_arch = "aarch64", test))]
+fn find_platform_root_bus(platform_dir: &Path, root_complex: &str) -> Option<String> {
+    let root_bus = format!("pci0000:{root_complex}");
+
+    fs::read_dir(platform_dir)
+        .ok()?
+        .flatten()
+        .find(|entry| entry.path().join(&root_bus).is_dir())
+        .and_then(|entry| {
+            Some(format!(
+                "/devices/platform/{}/{}",
+                entry.file_name().to_str()?,
+                root_bus
+            ))
+        })
+}
+
 #[cfg(target_arch = "aarch64")]
 pub fn create_pci_root_bus_path(root_complex: &str) -> String {
-    let ret = format!("/devices/platform/4010000000.pcie/pci0000:{root_complex}");
-
     let acpi_root_bus_path = format!("/devices/pci0000:{root_complex}");
-    let mut acpi_sysfs_dir = String::from(SYSFS_DIR);
-    let mut sysfs_dir = String::from(SYSFS_DIR);
-    let mut start_root_bus_path = String::from("/devices/platform/");
-    let end_root_bus_path = format!("/pci0000:{root_complex}");
 
     // check if there is pci bus path for acpi
-    acpi_sysfs_dir.push_str(&acpi_root_bus_path);
-    if fs::metadata(&acpi_sysfs_dir).is_ok() {
+    if fs::metadata(format!("{SYSFS_DIR}{acpi_root_bus_path}")).is_ok() {
         return acpi_root_bus_path;
     }
 
-    sysfs_dir.push_str(&start_root_bus_path);
-    let entries = match fs::read_dir(sysfs_dir) {
-        Ok(e) => e,
-        Err(_) => return ret,
-    };
-    for entry in entries {
-        let pathname = match entry {
-            Ok(p) => p.path(),
-            Err(_) => return ret,
-        };
-        let dir_name = match pathname.file_name() {
-            Some(p) => p.to_str(),
-            None => return ret,
-        };
-        let dir_name = match dir_name {
-            Some(p) => p,
-            None => return ret,
-        };
-        let dir_name = String::from(dir_name);
-        if dir_name.ends_with(".pcie") {
-            start_root_bus_path.push_str(&dir_name);
-            start_root_bus_path.push_str(&end_root_bus_path);
-            return start_root_bus_path;
-        }
-    }
-
-    ret
+    find_platform_root_bus(
+        Path::new(&format!("{SYSFS_DIR}/devices/platform")),
+        root_complex,
+    )
+    .unwrap_or_else(|| format!("/devices/platform/4010000000.pcie/pci0000:{root_complex}"))
 }
 
 cfg_if! {
@@ -186,5 +179,52 @@ mod tests {
         assert_eq!(path.len(), 2);
         assert_eq!(path[0].slot(), 0x00);
         assert_eq!(path[1].slot(), 0x02);
+    }
+
+    fn platform_dir(entries: &[(&str, bool)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, with_root_bus) in entries {
+            let path = dir.path().join(name);
+            if *with_root_bus {
+                fs::create_dir_all(path.join("pci0000:00")).unwrap();
+            } else {
+                fs::create_dir_all(path).unwrap();
+            }
+        }
+        dir
+    }
+
+    #[test]
+    fn test_find_platform_root_bus_cloud_hypervisor() {
+        let dir = platform_dir(&[("30000000.pci", true)]);
+        assert_eq!(
+            find_platform_root_bus(dir.path(), "00"),
+            Some("/devices/platform/30000000.pci/pci0000:00".to_string())
+        );
+    }
+
+    #[test]
+    fn test_find_platform_root_bus_qemu_virt() {
+        let dir = platform_dir(&[("4010000000.pcie", true)]);
+        assert_eq!(
+            find_platform_root_bus(dir.path(), "00"),
+            Some("/devices/platform/4010000000.pcie/pci0000:00".to_string())
+        );
+    }
+
+    #[test]
+    fn test_find_platform_root_bus_skips_entries_without_root_bus() {
+        let dir = platform_dir(&[("serial8250", false), ("30000000.pci", false)]);
+        assert_eq!(find_platform_root_bus(dir.path(), "00"), None);
+    }
+
+    #[test]
+    fn test_find_platform_root_bus_empty_or_missing_dir() {
+        let dir = platform_dir(&[]);
+        assert_eq!(find_platform_root_bus(dir.path(), "00"), None);
+        assert_eq!(
+            find_platform_root_bus(&dir.path().join("absent"), "00"),
+            None
+        );
     }
 }
