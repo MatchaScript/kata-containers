@@ -24,6 +24,18 @@ fn sl() -> slog::Logger {
     slog_scope::logger().new(o!("subsystem" => "uevent"))
 }
 
+// VMMs that boot the guest without ACPI (Cloud Hypervisor on aarch64 with a
+// direct kernel boot) have no way to notify the guest of a PCI hotplug: the
+// device sits on the bus with a responding config space, but no uevent is
+// ever emitted for it. Rescanning the bus enumerates it and makes the kernel
+// emit the uevent we are about to wait for. Failing to write is not fatal:
+// the wait proceeds as before.
+fn rescan_pci_bus(rescan_path: &str) {
+    if let Err(e) = std::fs::write(rescan_path, "1") {
+        warn!(sl(), "failed to rescan PCI bus"; "path" => rescan_path, "error" => format!("{}", e));
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Uevent {
     pub action: String,
@@ -136,6 +148,11 @@ pub async fn wait_for_uevent(
     let idx = sb.uevent_watchers.len();
     sb.uevent_watchers.push(Some((Box::new(matcher), tx)));
     drop(sb); // unlock
+
+    // Trigger the hotplug uevent for VMMs that cannot deliver one themselves.
+    // The watcher is already registered, so the resulting event is caught; the
+    // early return above makes this a no-op once the event has arrived.
+    rescan_pci_bus(&format!("{}/rescan", SYSFS_BUS_PCI_PATH));
 
     info!(sl(), "{}: waiting on channel", logprefix);
 
@@ -257,6 +274,17 @@ mod tests {
         fn is_match(&self, _: &Uevent) -> bool {
             true
         }
+    }
+
+    #[test]
+    fn test_rescan_pci_bus() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rescan");
+        rescan_pci_bus(path.to_str().unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "1");
+
+        // A missing path must not panic.
+        rescan_pci_bus(dir.path().join("missing/rescan").to_str().unwrap());
     }
 
     #[tokio::test]
