@@ -36,6 +36,8 @@ pub struct NetworkPair {
     pub virt_iface: NetworkInterface,
     pub model: Arc<dyn network_model::NetworkModel>,
     pub network_qos: bool,
+    /// Whether the virt end is a layer 3 device (netkit in L3 mode).
+    pub l3: bool,
     /// Number of virtio queue pairs (each pair = 1 RX + 1 TX).
     /// Derived from `network_queues` in the hypervisor TOML config.
     pub network_queues: usize,
@@ -84,8 +86,14 @@ impl NetworkPair {
         // the one inside the VM in order to avoid any firewall issues. The
         // bridge created by the network plugin on the host actually expects
         // to see traffic from this MAC address and not another one.
+        //
+        // A netkit in L3 mode carries an all-zero MAC, which is not usable
+        // as the guest NIC address, and it ignores the ethernet header
+        // anyway, so any MAC works for the VM side: use the TAP's own.
+        let l3 = virt_link.is_l3();
+        let mac_link = if l3 { &tap_link } else { &virt_link };
         let tap_hard_addr =
-            utils::get_mac_addr(&virt_link.attrs().hardware_addr).context("get mac addr")?;
+            utils::get_mac_addr(&mac_link.attrs().hardware_addr).context("get mac addr")?;
 
         // Save the TAP Mac address to the virt_iface so that it can later updated
         // the guest's gateway IP's mac as this TAP device. This MAC address has
@@ -132,6 +140,7 @@ impl NetworkPair {
             },
             model,
             network_qos: false,
+            l3,
             network_queues: queues,
         };
 
@@ -198,6 +207,8 @@ mod tests {
 
     use super::*;
     use crate::network::network_model::TC_FILTER_NET_MODEL_STR;
+    use netlink_packet_route::link::NetkitMode;
+    use rtnetlink::LinkNetkit;
     use test_utils::skip_if_not_root;
     use utils::link::net_test_utils::delete_link;
 
@@ -271,5 +282,53 @@ mod tests {
                 assert!(delete_link(&handle, tap_name.as_str()).await.is_ok());
             }
         }
+    }
+
+    #[actix_rt::test]
+    async fn test_network_pair_netkit_l3() {
+        let idx = 654321;
+        let virt_iface_name = format!("eth{}", idx);
+        let tap_name = format!("tap{}{}", idx, TAP_SUFFIX);
+
+        skip_if_not_root!();
+
+        let (conn, handle, _) = rtnetlink::new_connection().unwrap();
+        let thread_handler = tokio::spawn(conn);
+        defer!({
+            thread_handler.abort();
+        });
+
+        // mock the CNI plugin dropping a netkit L3 device in the netns;
+        // kernels without netkit (< 6.7) reject the add, skip there
+        if handle
+            .link()
+            .add(
+                LinkNetkit::new(
+                    virt_iface_name.as_str(),
+                    format!("{}_peer", virt_iface_name).as_str(),
+                    NetkitMode::L3,
+                )
+                .build(),
+            )
+            .execute()
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let pair = NetworkPair::new(&handle, idx, "", TC_FILTER_NET_MODEL_STR, 2)
+            .await
+            .unwrap();
+
+        // the netkit has no usable MAC, so the guest NIC takes the TAP's
+        let tap_link = get_link_by_name(&handle, tap_name.as_str()).await.unwrap();
+        let tap_hard_addr = utils::get_mac_addr(&tap_link.attrs().hardware_addr).unwrap();
+        assert!(pair.l3);
+        assert_eq!(pair.tap.tap_iface.hard_addr, tap_hard_addr);
+        assert_ne!(pair.tap.tap_iface.hard_addr, "00:00:00:00:00:00");
+
+        assert!(delete_link(&handle, virt_iface_name.as_str()).await.is_ok());
+        assert!(delete_link(&handle, tap_name.as_str()).await.is_ok());
     }
 }

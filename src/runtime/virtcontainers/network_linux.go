@@ -100,6 +100,8 @@ func LoadNetwork(netInfo persistapi.NetworkInfo) Network {
 			ep = &PhysicalEndpoint{}
 		case VethEndpointType:
 			ep = &VethEndpoint{}
+		case NetkitEndpointType:
+			ep = &NetkitEndpoint{}
 		case VhostUserEndpointType:
 			ep = &VhostUserEndpoint{}
 		case MacvlanEndpointType:
@@ -203,6 +205,9 @@ func (n *LinuxNetwork) addSingleEndpoint(ctx context.Context, s *Sandbox, netInf
 		} else if netInfo.Iface.Type == "veth" {
 			networkLogger().Info("veth interface found")
 			endpoint, err = createVethNetworkEndpoint(idx, netInfo.Iface.Name, n.interworkingModel)
+		} else if netInfo.Iface.Type == "netkit" {
+			networkLogger().Info("netkit interface found")
+			endpoint, err = createNetkitNetworkEndpoint(idx, netInfo.Iface.Name, n.interworkingModel)
 		} else if netInfo.Iface.Type == "ipvlan" {
 			networkLogger().Info("ipvlan interface found")
 			endpoint, err = createIPVlanNetworkEndpoint(idx, netInfo.Iface.Name)
@@ -802,6 +807,8 @@ func getLinkForEndpoint(endpoint Endpoint, netHandle *netlink.Handle) (netlink.L
 		// *netlink.Veth for real veths, *netlink.Device for mlx5
 		// SFs / generic netdevs). All callers only need Attrs().
 		return link, nil
+	case *NetkitEndpoint:
+		return getLinkByName(netHandle, name, &netlink.Netkit{})
 	case *MacvlanEndpoint:
 		return getLinkByName(netHandle, name, &netlink.Macvlan{})
 	case *IPVlanEndpoint:
@@ -826,6 +833,10 @@ func getLinkByName(netHandle *netlink.Handle, name string, expectedLink netlink.
 		}
 	case (&netlink.Veth{}).Type():
 		if l, ok := link.(*netlink.Veth); ok {
+			return l, nil
+		}
+	case (&netlink.Netkit{}).Type():
+		if l, ok := link.(*netlink.Netkit); ok {
 			return l, nil
 		}
 	case (&netlink.Macvtap{}).Type():
@@ -1025,6 +1036,11 @@ func tapNetworkPair(ctx context.Context, endpoint Endpoint, queues int, disableV
 	// bridge created by the network plugin on the host actually expects
 	// to see traffic from this MAC address and not another one.
 	tapHardAddr := attrs.HardwareAddr
+	if len(attrs.HardwareAddr) == 0 {
+		// L3 devices (e.g., netkit in L3 mode) have no MAC address and are not currently supported.
+		// They require IP routing instead of L2 bridging, which is not currently implemented.
+		return fmt.Errorf("Device %s has no MAC address (netkit L3 mode is not supported - use netkit L2 mode or veth devices)", attrs.Name)
+	}
 	netPair.TAPIface.HardAddr = attrs.HardwareAddr.String()
 
 	if err := netHandle.LinkSetMTU(tapLink, attrs.MTU); err != nil {
@@ -1122,7 +1138,14 @@ func setupTCFiltering(ctx context.Context, endpoint Endpoint, queues int, disabl
 	// the one inside the VM in order to avoid any firewall issues. The
 	// bridge created by the network plugin on the host actually expects
 	// to see traffic from this MAC address and not another one.
+	//
+	// L3 devices (netkit in L3 mode) have no MAC address and ignore the
+	// Ethernet header, so any MAC works for the VM side: use the random
+	// one generated for the network pair.
 	netPair.TAPIface.HardAddr = attrs.HardwareAddr.String()
+	if len(attrs.HardwareAddr) == 0 {
+		netPair.TAPIface.HardAddr = netPair.VirtIface.HardAddr
+	}
 
 	if err := netHandle.LinkSetMTU(tapLink, attrs.MTU); err != nil {
 		return fmt.Errorf("Could not set TAP MTU %d: %s", attrs.MTU, err)
@@ -1142,11 +1165,25 @@ func setupTCFiltering(ctx context.Context, endpoint Endpoint, queues int, disabl
 		return err
 	}
 
-	if err := addRedirectTCFilter(attrs.Index, tapAttrs.Index); err != nil {
+	// An L3 device (netkit in L3 mode) has an all-zero MAC and its
+	// kernel stack builds and accepts frames addressed to that zero MAC
+	// only. The VM NIC has a real MAC, so rewrite the destination MAC in
+	// both directions to keep each side's IP stack from dropping the
+	// frame as PACKET_OTHERHOST.
+	var toVM, toHost net.HardwareAddr
+	if len(attrs.HardwareAddr) == 0 {
+		toVM, err = net.ParseMAC(netPair.TAPIface.HardAddr)
+		if err != nil {
+			return err
+		}
+		toHost = make(net.HardwareAddr, len(toVM))
+	}
+
+	if err := addRedirectTCFilter(attrs.Index, tapAttrs.Index, toVM); err != nil {
 		return err
 	}
 
-	if err := addRedirectTCFilter(tapAttrs.Index, attrs.Index); err != nil {
+	if err := addRedirectTCFilter(tapAttrs.Index, attrs.Index, toHost); err != nil {
 		return err
 	}
 
@@ -1189,22 +1226,31 @@ func addQdiscIngress(index int) error {
 //
 // This is equivalent to calling:
 // `tc filter add dev source parent ffff: protocol all u32 match u8 0 0 action mirred egress redirect dev dest`
-func addRedirectTCFilter(sourceIndex, destIndex int) error {
+// addRedirectTCFilter redirects all ingress traffic of sourceIndex to the
+// egress of destIndex. When dstMAC is not nil the destination MAC of each
+// frame is rewritten to it first.
+func addRedirectTCFilter(sourceIndex, destIndex int, dstMAC net.HardwareAddr) error {
+	var actions []netlink.Action
+	if dstMAC != nil {
+		pedit := netlink.NewPeditAction()
+		pedit.DstMacAddr = dstMAC
+		actions = append(actions, pedit)
+	}
+	actions = append(actions, &netlink.MirredAction{
+		ActionAttrs: netlink.ActionAttrs{
+			Action: netlink.TC_ACT_STOLEN,
+		},
+		MirredAction: netlink.TCA_EGRESS_REDIR,
+		Ifindex:      destIndex,
+	})
+
 	filter := &netlink.U32{
 		FilterAttrs: netlink.FilterAttrs{
 			LinkIndex: sourceIndex,
 			Parent:    netlink.MakeHandle(0xffff, 0),
 			Protocol:  unix.ETH_P_ALL,
 		},
-		Actions: []netlink.Action{
-			&netlink.MirredAction{
-				ActionAttrs: netlink.ActionAttrs{
-					Action: netlink.TC_ACT_STOLEN,
-				},
-				MirredAction: netlink.TCA_EGRESS_REDIR,
-				Ifindex:      destIndex,
-			},
-		},
+		Actions: actions,
 	}
 
 	if err := netlink.FilterAdd(filter); err != nil {
@@ -1449,7 +1495,7 @@ func networkInfoFromLink(handle *netlink.Handle, link netlink.Link) (NetworkInfo
 func addRxRateLimiter(endpoint Endpoint, maxRate uint64) error {
 	var linkName string
 	switch ep := endpoint.(type) {
-	case *VethEndpoint, *IPVlanEndpoint, *TuntapEndpoint, *MacvlanEndpoint:
+	case *VethEndpoint, *NetkitEndpoint, *IPVlanEndpoint, *TuntapEndpoint, *MacvlanEndpoint:
 		netPair := endpoint.NetworkPair()
 		linkName = netPair.TAPIface.Name
 	case *MacvtapEndpoint, *TapEndpoint:
@@ -1589,7 +1635,7 @@ func addIFBRedirecting(sourceIndex int, ifbIndex int) error {
 		return err
 	}
 
-	if err := addRedirectTCFilter(sourceIndex, ifbIndex); err != nil {
+	if err := addRedirectTCFilter(sourceIndex, ifbIndex, nil); err != nil {
 		return err
 	}
 
@@ -1606,7 +1652,7 @@ func addTxRateLimiter(endpoint Endpoint, maxRate uint64) error {
 	var netPair *NetworkInterfacePair
 	var linkName string
 	switch ep := endpoint.(type) {
-	case *VethEndpoint, *IPVlanEndpoint, *TuntapEndpoint, *MacvlanEndpoint:
+	case *VethEndpoint, *NetkitEndpoint, *IPVlanEndpoint, *TuntapEndpoint, *MacvlanEndpoint:
 		netPair = endpoint.NetworkPair()
 		switch netPair.NetInterworkingModel {
 		// For those endpoints we've already used tcfilter as their inter-networking model,
@@ -1679,7 +1725,7 @@ func removeHTBQdisc(linkName string) error {
 func removeRxRateLimiter(endpoint Endpoint, networkNSPath string) error {
 	var linkName string
 	switch ep := endpoint.(type) {
-	case *VethEndpoint, *IPVlanEndpoint, *TuntapEndpoint, *MacvlanEndpoint:
+	case *VethEndpoint, *NetkitEndpoint, *IPVlanEndpoint, *TuntapEndpoint, *MacvlanEndpoint:
 		netPair := endpoint.NetworkPair()
 		linkName = netPair.TAPIface.Name
 	case *MacvtapEndpoint, *TapEndpoint:
@@ -1700,7 +1746,7 @@ func removeRxRateLimiter(endpoint Endpoint, networkNSPath string) error {
 func removeTxRateLimiter(endpoint Endpoint, networkNSPath string) error {
 	var linkName string
 	switch ep := endpoint.(type) {
-	case *VethEndpoint, *IPVlanEndpoint, *TuntapEndpoint, *MacvlanEndpoint:
+	case *VethEndpoint, *NetkitEndpoint, *IPVlanEndpoint, *TuntapEndpoint, *MacvlanEndpoint:
 		netPair := endpoint.NetworkPair()
 		switch netPair.NetInterworkingModel {
 		case NetXConnectTCFilterModel:

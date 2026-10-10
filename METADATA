@@ -1,0 +1,20 @@
+Name: Kata Containers
+URL: https://github.com/kata-containers/kata-containers
+Version: 4.2.0-257-g46c507fe4
+Revision: 46c507fe445370f0728aeefbfd16c49cead0493d
+Update Mechanism: Manual
+License: Apache-2.0
+License File: LICENSE
+
+Local Modifications:
+The snapshot equals Revision. Changes since then are the commits touching
+this directory in the monorepo history:
+- kernel: Enable netkit device support
+- runtime: Add support for netkit endpoints
+- runtime: Reject netkit L3 devices with clear error
+- runtime: Support netkit L3 endpoints with the TC filter model
+- runtime-rs: Enable Cloud Hypervisor on aarch64
+- runtime-rs: Use the netlink-packet-route fork with pedit
+- runtime-rs: Support netkit L3 endpoints with the TC filter model
+- agent: Find the aarch64 PCI root bus by its pci0000 child
+- agent: Rescan the PCI bus before waiting for a hotplug uevent

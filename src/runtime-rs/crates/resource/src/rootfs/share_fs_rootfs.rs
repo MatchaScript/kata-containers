@@ -21,6 +21,7 @@ pub(crate) struct ShareFsRootfs {
     guest_path: String,
     share_fs: Arc<dyn ShareFs>,
     config: ShareFsRootfsConfig,
+    mounted_bundle_rootfs: bool,
 }
 
 impl ShareFsRootfs {
@@ -34,7 +35,7 @@ impl ShareFsRootfs {
             let bundle_rootfs = format!("{bundle_path}/{ROOTFS}");
             rootfs.mount(&bundle_rootfs).context(format!(
                 "mount rootfs from {:?} to {}",
-                &rootfs, &bundle_rootfs
+                rootfs, bundle_rootfs
             ))?;
             bundle_rootfs
         } else {
@@ -59,6 +60,7 @@ impl ShareFsRootfs {
             guest_path: mount_result.guest_path,
             share_fs: Arc::clone(share_fs),
             config,
+            mounted_bundle_rootfs: rootfs.is_some(),
         })
     }
 }
@@ -89,8 +91,11 @@ impl Rootfs for ShareFsRootfs {
             .await
             .context("umount shared rootfs")?;
 
-        // Umount the bundle rootfs
-        umount_timeout(&self.config.source, 0).context("umount bundle rootfs")?;
+        // CRI-O supplies an already mounted rootfs with no rootfs mounts in the
+        // create request. Only unmount the source when we mounted it ourselves.
+        if self.mounted_bundle_rootfs {
+            umount_timeout(&self.config.source, 0).context("umount bundle rootfs")?;
+        }
         Ok(())
     }
 }

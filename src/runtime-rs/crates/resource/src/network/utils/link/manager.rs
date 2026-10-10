@@ -5,7 +5,7 @@
 //
 
 use netlink_packet_route::link::{
-    InfoBridge, InfoData, InfoKind, LinkAttribute, LinkInfo, LinkMessage,
+    InfoBridge, InfoData, InfoKind, InfoNetkit, LinkAttribute, LinkInfo, LinkMessage, NetkitMode,
 };
 
 use super::{Link, LinkAttrs};
@@ -120,6 +120,11 @@ fn link_info(mut infos: Vec<LinkInfo>) -> Box<dyn Link> {
                         link = Some(Box::new(Bridge::default()));
                     }
                 }
+                InfoKind::Netkit => {
+                    if link.is_none() {
+                        link = Some(Box::new(Netkit::default()));
+                    }
+                }
                 _ => {
                     if link.is_none() {
                         link = Some(Box::new(Device::default()));
@@ -144,6 +149,9 @@ fn link_info(mut infos: Vec<LinkInfo>) -> Box<dyn Link> {
                 }
                 InfoData::Bridge(ibs) => {
                     link = Some(Box::new(parse_bridge(ibs)));
+                }
+                InfoData::Netkit(ins) => {
+                    link = Some(Box::new(parse_netkit(ins)));
                 }
                 _ => {
                     link = Some(Box::new(Device::default()));
@@ -182,6 +190,16 @@ fn parse_bridge(mut ibs: Vec<InfoBridge>) -> Bridge {
         }
     }
     bridge
+}
+
+fn parse_netkit(mut ins: Vec<InfoNetkit>) -> Netkit {
+    let mut netkit = Netkit::default();
+    while let Some(item) = ins.pop() {
+        if let InfoNetkit::Mode(mode) = item {
+            netkit.l3 = mode == NetkitMode::L3;
+        }
+    }
+    netkit
 }
 
 macro_rules! impl_network_dev {
@@ -227,3 +245,49 @@ pub struct Bridge {
 }
 
 impl_network_dev!("bridge", Bridge);
+
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
+pub struct Netkit {
+    attrs: Option<LinkAttrs>,
+    pub l3: bool,
+}
+
+impl Link for Netkit {
+    fn attrs(&self) -> &LinkAttrs {
+        self.attrs.as_ref().unwrap()
+    }
+    fn set_attrs(&mut self, attr: LinkAttrs) {
+        self.attrs = Some(attr);
+    }
+    fn r#type(&self) -> &'static str {
+        "netkit"
+    }
+    fn is_l3(&self) -> bool {
+        self.l3
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn netkit_link(mode: NetkitMode) -> Box<dyn Link> {
+        let mut msg = LinkMessage::default();
+        msg.attributes.push(LinkAttribute::LinkInfo(vec![
+            LinkInfo::Kind(InfoKind::Netkit),
+            LinkInfo::Data(InfoData::Netkit(vec![InfoNetkit::Mode(mode)])),
+        ]));
+        get_link_from_message(msg)
+    }
+
+    #[test]
+    fn test_netkit_mode() {
+        let l2 = netkit_link(NetkitMode::L2);
+        assert_eq!(l2.r#type(), "netkit");
+        assert!(!l2.is_l3());
+
+        let l3 = netkit_link(NetkitMode::L3);
+        assert_eq!(l3.r#type(), "netkit");
+        assert!(l3.is_l3());
+    }
+}

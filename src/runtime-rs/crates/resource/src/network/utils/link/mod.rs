@@ -145,4 +145,9 @@ pub trait Link: Send + Sync {
     fn attrs(&self) -> &LinkAttrs;
     fn set_attrs(&mut self, attr: LinkAttrs);
     fn r#type(&self) -> &str;
+    /// Whether the device operates at layer 3, i.e. has no MAC address and
+    /// ignores the ethernet header. Only netkit in L3 mode does.
+    fn is_l3(&self) -> bool {
+        false
+    }
 }

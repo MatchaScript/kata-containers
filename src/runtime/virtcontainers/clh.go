@@ -66,9 +66,9 @@ const (
 )
 
 const (
-	clhStateCreated = "Created"
-	clhStateRunning = "Running"
-	clhStatePaused  = "Paused"
+	clhStateCreated = chclient.VMSTATE_CREATED
+	clhStateRunning = chclient.VMSTATE_RUNNING
+	clhStatePaused  = chclient.VMSTATE_PAUSED
 )
 
 const (
@@ -468,24 +468,7 @@ func (clh *cloudHypervisor) enableProtection() error {
 
 	switch protection {
 	case tdxProtection:
-		firmwarePath, err := clh.config.FirmwareAssetPath()
-		if err != nil {
-			return err
-		}
-
-		if firmwarePath == "" {
-			return errors.New("Firmware path is not specified")
-		}
-
-		clh.vmconfig.Payload.SetFirmware(firmwarePath)
-
-		if clh.vmconfig.Platform == nil {
-			clh.vmconfig.Platform = chclient.NewPlatformConfig()
-		}
-		clh.vmconfig.Platform.SetTdx(true)
-
-		return nil
-
+		return errors.New("TDX protection is not supported by Cloud Hypervisor")
 	case sevProtection:
 		return errors.New("SEV protection is not supported by Cloud Hypervisor")
 	case snpProtection:
@@ -663,10 +646,7 @@ func (clh *cloudHypervisor) CreateVM(ctx context.Context, id string, network Net
 	// Set initial amount of cpu's for the virtual machine
 	clh.vmconfig.Cpus = chclient.NewCpusConfig(int32(clh.config.NumVCPUs()), int32(clh.config.DefaultMaxVCPUs))
 
-	if pathExists("/dev/mshv") {
-		// The nested property is true by default, but is not supported yet on MSHV.
-		clh.vmconfig.Cpus.SetNested(false)
-	}
+	clh.vmconfig.Cpus.SetNested(!clh.config.DisableNestedVirtualization)
 
 	disableNvdimm := true
 	enableDax := false
@@ -694,7 +674,7 @@ func (clh *cloudHypervisor) CreateVM(ctx context.Context, id string, network Net
 		disk := chclient.NewDiskConfig()
 		disk.Path = &assetPath
 		disk.SetReadonly(true)
-		disk.SetImageType("Raw")
+		disk.SetImageType(chclient.IMAGETYPE_RAW)
 
 		diskRateLimiterConfig := clh.getDiskRateLimiterConfig()
 		if diskRateLimiterConfig != nil {
@@ -715,22 +695,22 @@ func (clh *cloudHypervisor) CreateVM(ctx context.Context, id string, network Net
 		// Use HVC as the guest console only in debug mode, only
 		// for Confidential Guests
 		if clh.config.Debug {
-			clh.vmconfig.Console = chclient.NewConsoleConfig(cctTTY)
+			clh.vmconfig.Console = chclient.NewConsoleConfig(chclient.CONSOLEMODE_TTY)
 		} else {
-			clh.vmconfig.Console = chclient.NewConsoleConfig(cctOFF)
+			clh.vmconfig.Console = chclient.NewConsoleConfig(chclient.CONSOLEMODE_OFF)
 		}
 
-		clh.vmconfig.Serial = chclient.NewConsoleConfig(cctOFF)
+		clh.vmconfig.Serial = chclient.NewSerialConfig(chclient.CONSOLEMODE_OFF)
 	} else {
 		// Use serial port as the guest console only in debug mode,
 		// so that we can gather early OS booting log
 		if clh.config.Debug {
-			clh.vmconfig.Serial = chclient.NewConsoleConfig(cctTTY)
+			clh.vmconfig.Serial = chclient.NewSerialConfig(chclient.CONSOLEMODE_TTY)
 		} else {
-			clh.vmconfig.Serial = chclient.NewConsoleConfig(cctOFF)
+			clh.vmconfig.Serial = chclient.NewSerialConfig(chclient.CONSOLEMODE_OFF)
 		}
 
-		clh.vmconfig.Console = chclient.NewConsoleConfig(cctOFF)
+		clh.vmconfig.Console = chclient.NewConsoleConfig(chclient.CONSOLEMODE_OFF)
 	}
 	clh.vmconfig.Console.SetIommu(clh.config.IOMMU)
 
@@ -1122,7 +1102,7 @@ func (clh *cloudHypervisor) addInitdataDisk(initdataImage string) {
 		disk.Direct = &clh.config.BlockDeviceCacheDirect
 	}
 	disk.SetIommu(clh.config.IOMMU)
-	disk.SetImageType("Raw")
+	disk.SetImageType(chclient.IMAGETYPE_RAW)
 
 	if rl := clh.getDiskRateLimiterConfig(); rl != nil {
 		disk.SetRateLimiterConfig(*rl)
@@ -1161,7 +1141,7 @@ func (clh *cloudHypervisor) hotplugAddBlockDevice(drive *config.BlockDrive) erro
 	clhDisk := *chclient.NewDiskConfig()
 	clhDisk.Path = &drive.File
 	clhDisk.Readonly = &drive.ReadOnly
-	clhDisk.SetImageType("Raw")
+	clhDisk.SetImageType(chclient.IMAGETYPE_RAW)
 	clhDisk.VhostUser = func(b bool) *bool { return &b }(false)
 	if clh.config.BlockDeviceCacheSet {
 		clhDisk.Direct = &clh.config.BlockDeviceCacheDirect
@@ -1212,7 +1192,8 @@ func (clh *cloudHypervisor) coldPlugVFIODevice(device *config.VFIODev) error {
 		"bdf":    device.BDF,
 	}).Info("Cold-plugging VFIO device into VM config")
 
-	clhDevice := *chclient.NewDeviceConfig(device.SysfsDev)
+	clhDevice := *chclient.NewDeviceConfig()
+	clhDevice.SetPath(device.SysfsDev)
 	clhDevice.SetIommu(clh.config.IOMMU)
 	clhDevice.SetId(device.ID)
 
@@ -1234,7 +1215,8 @@ func (clh *cloudHypervisor) hotPlugVFIODevice(device *config.VFIODev) error {
 	defer cancel()
 
 	// Create the clh device config via the constructor to ensure default values are properly assigned
-	clhDevice := *chclient.NewDeviceConfig(device.SysfsDev)
+	clhDevice := *chclient.NewDeviceConfig()
+	clhDevice.SetPath(device.SysfsDev)
 	clhDevice.SetIommu(clh.config.IOMMU)
 	pciInfo, _, err := cl.VmAddDevicePut(ctx, clhDevice)
 	if err != nil {
@@ -1905,11 +1887,6 @@ func (clh *cloudHypervisor) launchClh() error {
 // Cloud-hypervisor CLI builder
 //
 //###########################################################################
-
-const (
-	cctOFF string = "Off"
-	cctTTY string = "Tty"
-)
 
 const (
 	cscAPIsocket string = "--api-socket"

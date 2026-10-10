@@ -38,6 +38,16 @@
 #   come back after a reboot. Uninstall drops that file but never unloads a
 #   module, because module state is host-global and may be in use by something
 #   else.
+#
+# NOTE on finding out what went wrong in "job" mode:
+#   A failed rollout names the nodes that failed and what stopped each of them,
+#   in the `helm install` output, as an Event on each node, and afterwards under
+#   `kubectl get nodes -l kata-deploy-job-dispatcher/result=failed`. None of it
+#   is configured here; it is what a rollout does.
+#
+#   Each stage writes why it is giving up to /dev/termination-log, so the reason
+#   is in the pod's status rather than only in a log that
+#   job.ttlSecondsAfterFinished deletes along with the pod.
 deploymentMode: job  # daemonset | job
 
 # Settings specific to deploymentMode: job
@@ -48,7 +58,7 @@ job:
   # released independently of Kata Containers, so its version is pinned here.
   dispatcherImage:
     reference: ghcr.io/kata-containers/k8s-job-dispatcher
-    tag: "0.2.0"
+    tag: "0.3.0"
   # Where the dispatcher pods themselves may run (install and uninstall). Nothing
   # to do with which nodes get Kata - that is the top-level `nodeSelector` /
   # `affinity` / `tolerations`.
@@ -204,6 +214,21 @@ job:
   # failed. One node failing never aborts the others.
   backoffLimit: 3
 
+# SELinux confinement for the installer's own containers. On an enforcing node
+# the unprivileged install stages are otherwise denied the host work they exist
+# to do; this loads a Kata-owned policy module and gives each stage a
+# least-privilege domain instead, so they can stay unprivileged.
+#
+# Needs policycoreutils (for semodule) on the SELinux-enabled nodes, unless their
+# policy already defines the domains. Nodes with SELinux off are unaffected, so it
+# is safe to set across a mixed cluster.
+#
+# Off by default because it mutates the node's policy store, and the modules are
+# left loaded on uninstall: list them with `semodule --list-modules=full | grep
+# kata-deploy` and remove each with `semodule -X <priority> -r <name>`.
+selinux:
+  enabled: false
+
 imagePullPolicy: Always
 
 imagePullSecrets: []
@@ -253,20 +278,33 @@ monitor:
       memory: 300Mi
 
 # Which Kubernetes flavour this cluster runs. It picks the host directory that
-# holds containerd's configuration, which is mounted into the install.
+# holds containerd's configuration, which is mounted into the install, and where
+# the kubelet keeps its root directory: k0s and microk8s both move it, and only
+# the right one leads to a Kata workload's ConfigMap/Secret updates and to the
+# Pod Resources API socket that GPU cold plug asks for its devices.
 #
 # Getting it wrong used to pass unnoticed: the install detects the runtime on the
 # node itself, so it would write a correct configuration into whichever directory
 # was mounted - and if that is not the one this node's containerd reads, Kata is
 # configured where nothing looks for it. The install now refuses to continue when
 # the two disagree, naming the value to set. Setting containerd.configDir takes
-# that check out of the way, being an explicit override of this derivation.
+# that check out of the way, being an explicit override of this derivation; it
+# says nothing about the kubelet, so this value still applies there.
 k8sDistribution: "k8s"  # k8s, k3s, rke2, k0s, microk8s
 
 # Containerd configuration overrides
 # These override the auto-detected paths based on k8sDistribution.
 # Use these when your containerd setup doesn't match any built-in distribution preset.
 containerd:
+  # Extra pod annotation patterns containerd passes to every Kata runtime,
+  # matched with filepath.Match.
+  #
+  # Whatever each runtime's Kata configuration enables is already forwarded.
+  # Agent, runtime, and container-resource annotations are not, nor is anything
+  # from another component. Add those patterns here.
+  # ["io.katacontainers.*"] restores the old unrestricted forwarding and is a
+  # security risk: any Kata annotation reaches the runtime.
+  extraPodAnnotations: []
   # Override the host directory where containerd config lives.
   # When empty, derived automatically from k8sDistribution.
   # Example: "/etc/my-containerd/"
@@ -282,7 +320,8 @@ containerd:
   configFileName: ""
   # Optional user-provided containerd drop-in TOML content.
   # This is written as an extra drop-in loaded after kata-deploy's generated drop-in,
-  # so user keys can override kata-deploy defaults.
+  # so user keys can override kata-deploy defaults. Its file name carries
+  # env.multiInstallSuffix, so side-by-side installations each own their own.
   # NOTE: default_size = "0" selects memory-backed rw layers even when
   # erofsSnapshotterMode is "disk"; do not set it when disk backing is intended.
   # Example: disable erofs fs-verity when the host backing filesystem may not
@@ -615,9 +654,12 @@ nodeBinaries: {}
 #       supportedArches:              # list of supported architectures
 #         - amd64
 #       allowedHypervisorAnnotations: []  # hypervisor annotations to pass through
+#       hypervisor:
+#         rootless: false             # run the VMM as an unprivileged user (see below)
 #       containerd:
 #         snapshotter: ""             # e.g. nydus, erofs, devmapper, or "" for default
 #         forceGuestPull: false       # force guest-side image pull in containerd
+#         extraPodAnnotations: []     # extra containerd pod annotations for this shim
 #       crio:
 #         guestPull: false            # enable guest-pull in CRI-O
 #       agent:
@@ -630,6 +672,23 @@ nodeBinaries: {}
 #         overhead:                  # override pod overhead (falls back to built-in defaults)
 #           memory: "160Mi"
 #           cpu: "250m"
+#
+# hypervisor.rootless runs that shim's VMM as an unprivileged user. kata-deploy
+# grants group access to /dev/kvm and to the TEE device the shim needs, and
+# records a udev rule so the permissions survive the device being re-created.
+# Each shim asks only for its own devices, so turning it on for qemu-runtime-rs
+# alone never creates the SEV or Secure Execution groups.
+#
+# /dev/vhost-vsock and /dev/vhost-net are left alone: the shim opens them while
+# still privileged and hands the VMM the descriptors, and granting access by
+# path would expose the host-wide CID namespace.
+#
+# Only the runtime-rs QEMU shims and clh-runtime-rs accept it, and asking for
+# it on any other shim fails the install. The Go runtime has a rootless option
+# of its own, but it only ever handled /dev/kvm.
+#
+# Requires deploymentMode: job, a persistent /etc, and a udev implementation
+# reading /etc/udev/rules.d. See docs/how-to/how-to-run-rootless-vmm.md.
 shims:
   disableAll: false
 
@@ -654,6 +713,8 @@ shims:
     supportedArches:
       - amd64
     allowedHypervisorAnnotations: []
+    hypervisor:
+      rootless: false
     containerd:
       snapshotter: ""
 
@@ -700,6 +761,8 @@ shims:
       - s390x
       - ppc64le
     allowedHypervisorAnnotations: []
+    hypervisor:
+      rootless: false
     containerd:
       snapshotter: ""
 
@@ -718,6 +781,8 @@ shims:
       - amd64
       - arm64
     allowedHypervisorAnnotations: []
+    hypervisor:
+      rootless: false
     containerd:
       snapshotter: ""
 
@@ -745,6 +810,8 @@ shims:
       - amd64
       - arm64
     allowedHypervisorAnnotations: []
+    hypervisor:
+      rootless: false
     containerd:
       snapshotter: ""
     nvrc:
@@ -784,6 +851,8 @@ shims:
     supportedArches:
       - amd64
     allowedHypervisorAnnotations: []
+    hypervisor:
+      rootless: false
     containerd:
       snapshotter: "nydus"
       forceGuestPull: false
@@ -828,6 +897,8 @@ shims:
     supportedArches:
       - amd64
     allowedHypervisorAnnotations: []
+    hypervisor:
+      rootless: false
     containerd:
       snapshotter: "nydus"
       forceGuestPull: false
@@ -862,6 +933,8 @@ shims:
     supportedArches:
       - amd64
     allowedHypervisorAnnotations: []
+    hypervisor:
+      rootless: false
     containerd:
       snapshotter: nydus
       forceGuestPull: false
@@ -890,6 +963,8 @@ shims:
     supportedArches:
       - amd64
     allowedHypervisorAnnotations: []
+    hypervisor:
+      rootless: false
     containerd:
       snapshotter: nydus
       forceGuestPull: false
@@ -918,6 +993,8 @@ shims:
     supportedArches:
       - s390x
     allowedHypervisorAnnotations: []
+    hypervisor:
+      rootless: false
     containerd:
       snapshotter: nydus
       forceGuestPull: false
@@ -949,6 +1026,8 @@ shims:
       - arm64
       - s390x
     allowedHypervisorAnnotations: []
+    hypervisor:
+      rootless: false
     containerd:
       snapshotter: nydus
       forceGuestPull: false

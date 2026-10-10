@@ -42,7 +42,7 @@
 
 use std::fmt::Debug;
 use std::fs;
-use std::io::{self, BufRead};
+use std::io;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,6 +66,40 @@ const PROC_FIELDS_PER_LINE: usize = 6;
 const PROC_DEVICE_INDEX: usize = 0;
 const PROC_PATH_INDEX: usize = 1;
 const PROC_TYPE_INDEX: usize = 2;
+const PROC_OPTIONS_INDEX: usize = 3;
+
+// /proc/mounts uses the fstab(5) field escaping convention; see getmntent(3).
+fn unescape_mount_field(field: &str) -> String {
+    let mut unescaped = String::with_capacity(field.len());
+    let mut chars = field.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            unescaped.push(ch);
+            continue;
+        }
+
+        let mut escaped = chars.clone();
+        let decoded = match (escaped.next(), escaped.next(), escaped.next()) {
+            (Some('0'), Some('4'), Some('0')) => Some(' '),
+            (Some('0'), Some('1'), Some('1')) => Some('\t'),
+            (Some('0'), Some('1'), Some('2')) => Some('\n'),
+            (Some('1'), Some('3'), Some('4')) => Some('\\'),
+            _ => None,
+        };
+
+        if let Some(decoded) = decoded {
+            chars.next();
+            chars.next();
+            chars.next();
+            unescaped.push(decoded);
+        } else {
+            unescaped.push(ch);
+        }
+    }
+
+    unescaped
+}
 
 lazy_static! {
     static ref MAX_MOUNT_PARAM_SIZE: usize =
@@ -129,12 +163,28 @@ pub struct LinuxMountInfo {
     pub path: String,
     /// Filesystem type of mount, third field of records from `/proc/mounts`.
     pub fs_type: String,
+    /// Mount options, fourth field of records from `/proc/mounts`.
+    pub options: Vec<String>,
 }
 
-/// Get the device and file system type of a mount point by parsing `/proc/mounts`.
+/// Get mount information for a mount point by parsing `/proc/mounts`.
 pub fn get_linux_mount_info(mount_point: &str) -> Result<LinuxMountInfo> {
     let mount_file = fs::File::open(PROC_MOUNTS_FILE)?;
-    let reader = io::BufReader::new(mount_file);
+    get_linux_mount_info_from_reader(mount_point, io::BufReader::new(mount_file))
+}
+
+fn get_linux_mount_info_from_reader<R: io::BufRead>(
+    mount_point: &str,
+    reader: R,
+) -> Result<LinuxMountInfo> {
+    // Mounting resolves symlinks in the target path, so `/proc/mounts` records
+    // the resolved path. In case `mount_point` contains a symlink, resolve it
+    // before comparing, or fall back to the original path if resolution fails.
+    // If resolution fails, compare the original path and let the scan determine
+    // whether a matching mount exists.
+    let requested_path = Path::new(mount_point);
+    let resolved_path =
+        fs::canonicalize(requested_path).unwrap_or_else(|_| requested_path.to_path_buf());
 
     for line in reader.lines() {
         let mount = line?;
@@ -148,16 +198,59 @@ pub fn get_linux_mount_info(mount_point: &str) -> Result<LinuxMountInfo> {
             ));
         }
 
-        if mount_point == fields[PROC_PATH_INDEX] {
+        let path = unescape_mount_field(fields[PROC_PATH_INDEX]);
+        if resolved_path == Path::new(&path) {
             return Ok(LinuxMountInfo {
                 device: fields[PROC_DEVICE_INDEX].to_string(),
-                path: fields[PROC_PATH_INDEX].to_string(),
+                path,
                 fs_type: fields[PROC_TYPE_INDEX].to_string(),
+                options: fields[PROC_OPTIONS_INDEX]
+                    .split(',')
+                    .map(str::to_string)
+                    .collect(),
             });
         }
     }
 
     Err(Error::NoMountEntry(mount_point.to_owned()))
+}
+
+/// Nested and stacked mounts must be detached before the mounts containing them.
+pub fn get_mount_points_under<P: AsRef<Path>>(root: P) -> Result<Vec<PathBuf>> {
+    let mount_file = fs::File::open(PROC_MOUNTS_FILE)?;
+    get_mount_points_under_from_reader(root.as_ref(), io::BufReader::new(mount_file))
+}
+
+fn get_mount_points_under_from_reader<R: io::BufRead>(
+    root: &Path,
+    reader: R,
+) -> Result<Vec<PathBuf>> {
+    // Match resolved paths because /proc/mounts does not retain symlink aliases.
+    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+
+    let mut mount_points = Vec::new();
+    for line in reader.lines() {
+        let mount = line?;
+        let fields: Vec<&str> = mount.split(' ').collect();
+
+        if fields.len() != PROC_FIELDS_PER_LINE {
+            return Err(Error::InvalidMountEntry(
+                PROC_FIELDS_PER_LINE,
+                fields.len(),
+                mount,
+            ));
+        }
+
+        let path = PathBuf::from(unescape_mount_field(fields[PROC_PATH_INDEX]));
+        if path.starts_with(&root) {
+            mount_points.push(path);
+        }
+    }
+
+    // Later entries cover earlier mounts at the same depth.
+    mount_points.reverse();
+    mount_points.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    Ok(mount_points)
 }
 
 /// Recursively create destination for a mount.
@@ -433,7 +526,7 @@ pub fn parse_mount_options<T: AsRef<str>>(options: &[T]) -> Result<(MsFlags, Str
     Ok((flags, data))
 }
 
-fn parse_mount_flags(mut flags: MsFlags, flag_str: &str) -> Option<MsFlags> {
+pub fn parse_mount_flags(mut flags: MsFlags, flag_str: &str) -> Option<MsFlags> {
     // Following mount options are applicable to fstab only.
     // - _netdev: The filesystem resides on a device that requires network access (used to prevent
     //   the system from attempting to mount these filesystems until the network has been enabled
@@ -684,9 +777,9 @@ fn get_longest_common_prefix(opts: &[String]) -> Option<PathBuf> {
 
     let mut paths = Vec::with_capacity(opts.len());
     for opt in opts.iter() {
-        match Path::new(opt).parent() {
-            None => return None,
-            Some(v) => paths.push(v),
+        {
+            let v = Path::new(opt).parent()?;
+            paths.push(v)
         }
     }
 
@@ -834,24 +927,135 @@ pub fn get_mount_type(m: &oci::Mount) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
     use std::path::PathBuf;
 
     #[test]
     fn test_get_linux_mount_info() {
-        let info = get_linux_mount_info("/dev/shm").unwrap();
+        let mount_point = "/__kata_mount_test__/mount";
+        let mounts = format!(
+            "none /other ext4 rw 0 0\ntmpfs {} tmpfs rw,nosuid,nodev 0 0\n",
+            mount_point
+        );
+
+        let info = get_linux_mount_info_from_reader(mount_point, mounts.as_bytes()).unwrap();
 
         assert_eq!(&info.device, "tmpfs");
         assert_eq!(&info.fs_type, "tmpfs");
-        assert_eq!(&info.path, "/dev/shm");
+        assert_eq!(&info.path, mount_point);
+        assert_eq!(info.options, ["rw", "nosuid", "nodev"]);
 
         assert!(matches!(
-            get_linux_mount_info(""),
+            get_linux_mount_info_from_reader("", mounts.as_bytes()),
             Err(Error::NoMountEntry(_))
         ));
         assert!(matches!(
-            get_linux_mount_info("/sys/fs/cgroup/do_not_exist/____hi"),
+            get_linux_mount_info_from_reader("/not-mounted", mounts.as_bytes()),
             Err(Error::NoMountEntry(_))
         ));
+
+        assert!(matches!(
+            get_linux_mount_info_from_reader(mount_point, "invalid entry\n".as_bytes()),
+            Err(Error::InvalidMountEntry(6, 2, _))
+        ));
+    }
+
+    #[test]
+    fn test_get_mount_points_under() {
+        let root = "/__kata_mount_test__/sbx";
+        let mounts = format!(
+            "tmpfs /__kata_mount_test__ tmpfs rw 0 0\n\
+             none {root}/rw/passthrough/vol ext4 rw 0 0\n\
+             none /__kata_mount_test__/sbx-other/rw ext4 rw 0 0\n\
+             none {root}/ro ext4 ro 0 0\n\
+             none {root}/rw/passthrough/c/rootfs ext4 rw 0 0\n\
+             none {root}/rw/passthrough/vol ext4 ro 0 0\n\
+             none {root}/rw/space\\040dir ext4 rw 0 0\n"
+        );
+
+        let mount_points =
+            get_mount_points_under_from_reader(Path::new(root), mounts.as_bytes()).unwrap();
+
+        assert_eq!(
+            mount_points,
+            [
+                format!("{root}/rw/passthrough/c/rootfs"),
+                format!("{root}/rw/passthrough/vol"),
+                format!("{root}/rw/passthrough/vol"),
+                format!("{root}/rw/space dir"),
+                format!("{root}/ro"),
+            ]
+            .map(PathBuf::from)
+        );
+
+        assert!(
+            get_mount_points_under_from_reader(Path::new("/not-mounted"), mounts.as_bytes())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            get_mount_points_under_from_reader(Path::new(root), "invalid entry\n".as_bytes()),
+            Err(Error::InvalidMountEntry(6, 2, _))
+        ));
+    }
+
+    #[test]
+    fn test_get_linux_mount_info_with_escaped_path() {
+        let cases = [
+            (
+                "/__kata_mount_test__/space dir",
+                r"/__kata_mount_test__/space\040dir",
+            ),
+            (
+                "/__kata_mount_test__/tab\tdir",
+                r"/__kata_mount_test__/tab\011dir",
+            ),
+            (
+                "/__kata_mount_test__/newline\ndir",
+                r"/__kata_mount_test__/newline\012dir",
+            ),
+            (
+                r"/__kata_mount_test__/backslash\dir",
+                r"/__kata_mount_test__/backslash\134dir",
+            ),
+            (
+                r"/__kata_mount_test__/literal\040",
+                r"/__kata_mount_test__/literal\134040",
+            ),
+        ];
+        let mut mounts = String::new();
+
+        for (_, escaped_path) in cases {
+            mounts.push_str(&format!("tmpfs {escaped_path} tmpfs rw,nosuid,nodev 0 0\n"));
+        }
+
+        for (path, _) in cases {
+            let info = get_linux_mount_info_from_reader(path, mounts.as_bytes()).unwrap();
+
+            assert_eq!(info.path, path);
+        }
+    }
+
+    #[test]
+    fn test_get_linux_mount_info_through_symlinked_parent() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let direct_dev = tmpdir.path().join("direct-dev");
+        let direct_shm = direct_dev.join("shm");
+        fs::create_dir_all(&direct_shm).unwrap();
+        let symlinked_dev = tmpdir.path().join("dev");
+        symlink(&direct_dev, &symlinked_dev).unwrap();
+        let mounts = format!("tmpfs {} tmpfs rw,nosuid,nodev 0 0\n", direct_shm.display());
+
+        let info = get_linux_mount_info_from_reader(
+            symlinked_dev.join("shm").to_str().unwrap(),
+            mounts.as_bytes(),
+        )
+        .unwrap();
+
+        assert_eq!(&info.device, "tmpfs");
+        assert_eq!(&info.fs_type, "tmpfs");
+        assert_eq!(&info.path, direct_shm.to_str().unwrap());
+        assert_eq!(info.options, ["rw", "nosuid", "nodev"]);
     }
 
     #[test]
